@@ -1,0 +1,227 @@
+#!/bin/bash
+#set -x
+
+# 
+# canctl add <bus_name>       create a new bus and show a virtual interface (vcanbr)
+# canctl del <bus_name>       disasscociate all containers
+# canctl list                list all virtual CAN bus
+# canctl show <bus_name>      show details for the specified CAN bus
+# 
+# canctl addif <if> <bus_name>      add interface to CAN bus
+# canctl delif <if> <bus_name>      delete interface to CAN bus
+# 
+# canctl attach <container> <bus>           attach container to CAN bus
+# canctl detach <container>:<if> <bus>      detach interface from container
+# 
+# canctl connect <containerA> <containerB>      interconnect containerA with containerB
+# canctl connect <containerA>:<if> <containerB>:<if>
+# canctl disconnect <containerA> <containerB>
+#
+# canctl move <if> <container>      move the interface into the container namespace     
+#
+# container: 
+#  - <pid>
+#  - docker:SHA256
+#  - podman:SHA256
+#
+info()
+{
+	echo "[ ] $*"
+}
+
+perror()
+{
+	echo "[e] ERROR $*" >&2
+    	exit 1
+}
+
+#modprobe vcan || perror "error loading vcan"
+#modprobe can-gw || perror "error loading can-gw"
+
+get_pid_by()
+{
+    local container=$1
+
+    local container_id_type=$(echo -n $container | cut -d: -f1)
+    local container_id_value=$(echo -n $container | cut -d: -f2)
+    case $container_id_type in 
+        "pid") 
+	     containerpid=$container_id_value 
+	     ps $pid 1>/dev/null 2>/dev/null || perror "pid '$pid' not found" 
+	     ;;
+        "docker")
+             containerpid=$(docker inspect --format '{{ .State.Pid }}' $container_id_value) || perror "Docker container '$container_id_value' not found"
+	     ;;
+	*)
+	     perror "invalid container spec"
+	     ;;
+    esac
+    # return 
+    echo -n $containerpid
+}
+
+create_bus()
+{
+    local bus_name=$1 # e.g. vcanbr0 
+
+    # check the existence of the virtual interface on the host (vcanbr0)
+    ip link show $bus_name && perror "interface already exists"
+    
+    # create a virtual interface
+    ip link add name $bus_name type vcan || perror "error creating device"
+    ip link set up dev $bus_name || perror "can't set the device up"
+}
+
+# create a virtual interface in an container
+addif_container()
+{
+    local container=$1  
+    local interface_name=$2  
+    local containerpid=$(get_pid_by $container)
+    
+    nsenter -n -t $containerpid ip link add $interface_name type vcan
+    nsenter -n -t $containerpid ip link set up dev $interface_name
+}
+
+# to attach host interfaces to a bus
+addif_bus()
+{
+    local interface_name=$1  
+    local bus_name=$2
+
+    # check interface on host
+    ip link show $interface_name || perror "target interface must exist"
+
+    # relay frames to the bus interface on the host
+    # this triggers again a relay to all CAN interfaces with can-gw rules
+    cangw -A -s $interface_name -d $bus_name -e 
+    cangw -A -s $bus_name -d $interface_name -e 
+}
+
+# attach an container by creating an interface inside the container
+# and attach it to the host
+attach_if_container()
+{
+    local container=$1  
+    local interface_name=$2  
+    local bus=$3 
+    local containerpid=$(get_pid_by $container)
+
+    local tmp_vxcanname_host="vx${containerpid}${interface_name}" # size limit!
+    local tmp_vxcanname_container="vx${containerpid}tmp"
+
+    ip link show $bus 1>/dev/null 2>/dev/null || perror "bus interface on the host doesn't exist"
+    nsenter -n -t $containerpid ip link show $interface_name 1>/dev/null 2>/dev/null && perror "interface in container already exists"
+
+    # create vxcan pair
+    ip link add $tmp_vxcanname_host type vxcan peer name $tmp_vxcanname_container
+    ip link set $tmp_vxcanname_container netns $containerpid
+    # relay
+    cangw -A -s $tmp_vxcanname_host -d $bus -e 
+    cangw -A -s $bus -d $tmp_vxcanname_host -e 
+    # rename to can0 in the container namespace and take it up
+    nsenter -n -t $containerpid ip link set name $interface_name dev $tmp_vxcanname_container
+    nsenter -n -t $containerpid ip link set $interface_name up
+    ip link set $tmp_vxcanname_host up
+}
+   
+# move interface into the container
+move_if_container()
+{
+    local container=$1  
+    local interface_name=$2  
+
+    local containerpid=$(get_pid_by $container)
+
+    ip link show $interface_name 1>/dev/null 2>/dev/null || perror "local interface not found"
+    nsenter -n -t $container1pid ip link show $interface_name 1>/dev/null 2>/dev/null && perror "local interface in container already exist"
+
+    ip link set $interface_name netns $containerpid
+    nsenter -n -t $containerpid ip link set $interface_name up
+}
+
+# create a vxcan pair and interconnect two containers
+connect_containers()
+{
+    local container1=$1  
+    local container1_ifname=$2 # final interface name
+    local container2=$3
+    local container2_ifname=$4 # final interface name in the remote container 
+
+    local tmp_vxcanname1="vx${containerpid}${container1_ifname}" # size limit!
+    local tmp_vxcanname2="vx${containerpid}${container2_ifname}"
+
+    container1pid=$(get_pid_by $container1)
+    container2pid=$(get_pid_by $container2)
+
+    # preconditions
+    ps $container1pid 1>/dev/null 2>/dev/null || perror "target process must exist"
+    nsenter -n -t $container1pid ip link show $container1_ifname 1>/dev/null 2>/dev/null && perror "local interface in containerA already exist"
+    ip link show $tmp_vxcanname1 1>/dev/null 2>/dev/null && perror "host tmp interface already exist"
+    ps $container2pid 1>/dev/null 2>/dev/null || perror "target process must exist"
+    nsenter -n -t $container2pid ip link show $container2_ifname 1>/dev/null 2>/dev/null && perror "remote interface already exists"
+    ip link show $tmp_vxcanname2 1>/dev/null 2>/dev/null && perror "host tmp interface already exist"
+
+    # create vxcan pair
+    ip link add $tmp_vxcanname1 type vxcan peer name $tmp_vxcanname2
+    ip link set $tmp_vxcanname1 netns $container1pid
+    ip link set $tmp_vxcanname2 netns $container2pid
+    # rename to can0 in the container namespace and take it up
+    nsenter -n -t $container1pid ip link set name $container1_ifname dev $tmp_vxcanname1
+    nsenter -n -t $container2pid ip link set name $container2_ifname dev $tmp_vxcanname2
+    # set up
+    nsenter -n -t $container1pid ip link set $container1_ifname up
+    nsenter -n -t $container2pid ip link set $container2_ifname up
+}
+
+parameter_check()
+{
+	regex=$1	
+	parameter=$2
+
+	[[ "$parameter" =~ ^[a-z]+[a-z0-9]+ ]]
+	return $?
+}
+
+usage()
+{
+	cat << EOF
+addbus vcanbr0 
+addif vcanbr0 can0
+addifc docker:alpine can0 
+moveif docker:alpine vcanbr0
+attachif docker:alpine can2 vcanbr0
+connect docker:alpine vxcan5 docker:ubuntu2 vxcan0
+EOF
+exit 1
+}
+
+[ $# -lt 1 ] && usage
+
+if [[ $1 == "addbus" ]] ; then
+	parameter_check "aaa" $2
+	create_bus $2
+
+elif [[ $1 == "addif" ]] ; then
+	addif_bus $2 $3
+
+elif [[ $1 == "addifc" ]] ; then
+	addif_container $2 $3
+
+elif [[ $1 == "moveif" ]] ; then
+	move_if_container $2 $3
+
+elif [[ $1 == "attachif" ]] ; then
+	attach_if_container $2 $3 $4
+
+elif [[ $1 == "connect" ]] ; then
+	connect_containers $2 $3 $4 $5
+
+else
+	echo "no such command: $1"
+	echo
+	usage
+	exit 1
+
+fi
+
