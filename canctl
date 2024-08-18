@@ -35,8 +35,9 @@ perror()
     	exit 1
 }
 
-#modprobe vcan || perror "error loading vcan"
-#modprobe can-gw || perror "error loading can-gw"
+modprobe vcan || perror "error loading vcan"
+modprobe can-gw || perror "error loading can-gw"
+type cangw >/dev/null 2>/dev/null || perror "error can-utils not installed"
 
 get_pid_by()
 {
@@ -44,20 +45,27 @@ get_pid_by()
 
     local container_id_type=$(echo -n $container | cut -d: -f1)
     local container_id_value=$(echo -n $container | cut -d: -f2)
+    local containerpid=0
+    local returncode=1
     case $container_id_type in 
         "pid") 
 	     containerpid=$container_id_value 
-	     ps $pid 1>/dev/null 2>/dev/null || perror "pid '$pid' not found" 
+	     ps --pid $pid 1>/dev/null 2>/dev/null
+             returncode=$?
 	     ;;
         "docker")
-             containerpid=$(docker inspect --format '{{ .State.Pid }}' $container_id_value) || perror "Docker container '$container_id_value' not found"
+             containerpid=$(docker inspect --format '{{ .State.Pid }}' $container_id_value)
+	     # TODO check if the container pid does not exit
+             returncode=$?
 	     ;;
 	*)
 	     perror "invalid container spec"
+             returncode=255
 	     ;;
     esac
     # return 
     echo -n $containerpid
+    return $returncode
 }
 
 create_bus()
@@ -65,32 +73,66 @@ create_bus()
     local bus_name=$1 # e.g. vcanbr0 
 
     # check the existence of the virtual interface on the host (vcanbr0)
-    ip link show $bus_name && perror "interface already exists"
+    ip link show $bus_name >/dev/null 2>/dev/null && perror "interface already exists"
     
     # create a virtual interface
     ip link add name $bus_name type vcan || perror "error creating device"
     ip link set up dev $bus_name || perror "can't set the device up"
+
+    ip link show $bus_name
+}
+
+delete_bus()
+{
+    local bus_name=$1 # e.g. vcanbr0 
+
+    # check the existence of the virtual interface on the host (vcanbr0)
+    ip link show $bus_name >/dev/null 2>/dev/null || perror "interface doesn't exist"
+    
+    # create a virtual interface
+    ip link set down dev $bus_name || perror "can't set the device down"
+    ip link del name $bus_name type vcan || perror "error deleting device"
 }
 
 # create a virtual interface in an container
 addif_container()
 {
     local container=$1  
-    local interface_name=$2  
-    local containerpid=$(get_pid_by $container)
+    local interface_name=$2 # can0 in the container
+    local containerpid=0
+    containerpid=$(get_pid_by $container)
+    [ $? -eq 0 ] || perror "process not found"
     
+    ps --pid $containerpid 1>/dev/null 2>/dev/null || perror "container pid '$pid' not found" 
+
     nsenter -n -t $containerpid ip link add $interface_name type vcan
     nsenter -n -t $containerpid ip link set up dev $interface_name
+}
+
+# delete a virtual interface in an container
+delif_container()
+{
+    local container=$1  
+    local interface_name=$2 # can0 in the container 
+    local containerpid=0
+    containerpid=$(get_pid_by $container)
+    [ $? -eq 0 ] || perror "process not found"
+    
+    ps --pid $containerpid 1>/dev/null 2>/dev/null || perror "container pid '$pid' not found" 
+
+    nsenter -n -t $containerpid ip link set down dev $interface_name
+    nsenter -n -t $containerpid ip link del $interface_name type vcan
 }
 
 # to attach host interfaces to a bus
 addif_bus()
 {
-    local interface_name=$1  
-    local bus_name=$2
+    local interface_name=$1 # can0
+    local bus_name=$2       # vcanbr0
 
     # check interface on host
-    ip link show $interface_name || perror "target interface must exist"
+    ip link show $bus_name >/dev/null 2>/dev/null || perror "bus interface must exist"
+    ip link show $interface_name >/dev/null 2>/dev/null || perror "target interface must exist"
 
     # relay frames to the bus interface on the host
     # this triggers again a relay to all CAN interfaces with can-gw rules
@@ -103,9 +145,13 @@ addif_bus()
 attach_if_container()
 {
     local container=$1  
-    local interface_name=$2  
-    local bus=$3 
-    local containerpid=$(get_pid_by $container)
+    local interface_name=$2 # can0 in the container 
+    local bus=$3            # vcanbr0
+    local containerpid=0
+    containerpid=$(get_pid_by $container)
+    [ $? -eq 0 ] || perror "process not found"
+
+    ps --pid $containerpid 1>/dev/null 2>/dev/null || perror "container pid '$pid' not found" 
 
     local tmp_vxcanname_host="vx${containerpid}${interface_name}" # size limit!
     local tmp_vxcanname_container="vx${containerpid}tmp"
@@ -131,7 +177,9 @@ move_if_container()
     local container=$1  
     local interface_name=$2  
 
-    local containerpid=$(get_pid_by $container)
+    local containerpid=0
+    containerpid=$(get_pid_by $container)
+    [ $? -eq 0 ] || perror "process not found"
 
     ip link show $interface_name 1>/dev/null 2>/dev/null || perror "local interface not found"
     nsenter -n -t $container1pid ip link show $interface_name 1>/dev/null 2>/dev/null && perror "local interface in container already exist"
@@ -152,13 +200,15 @@ connect_containers()
     local tmp_vxcanname2="vx${containerpid}${container2_ifname}"
 
     container1pid=$(get_pid_by $container1)
+    [ $? -eq 0 ] || perror "process not found"
     container2pid=$(get_pid_by $container2)
+    [ $? -eq 0 ] || perror "process not found"
 
     # preconditions
-    ps $container1pid 1>/dev/null 2>/dev/null || perror "target process must exist"
+    ps --pid $container1pid 1>/dev/null 2>/dev/null || perror "target process must exist"
     nsenter -n -t $container1pid ip link show $container1_ifname 1>/dev/null 2>/dev/null && perror "local interface in containerA already exist"
     ip link show $tmp_vxcanname1 1>/dev/null 2>/dev/null && perror "host tmp interface already exist"
-    ps $container2pid 1>/dev/null 2>/dev/null || perror "target process must exist"
+    ps --pid $container2pid 1>/dev/null 2>/dev/null || perror "target process must exist"
     nsenter -n -t $container2pid ip link show $container2_ifname 1>/dev/null 2>/dev/null && perror "remote interface already exists"
     ip link show $tmp_vxcanname2 1>/dev/null 2>/dev/null && perror "host tmp interface already exist"
 
@@ -186,12 +236,19 @@ parameter_check()
 usage()
 {
 	cat << EOF
-addbus vcanbr0 
-addif vcanbr0 can0
-addifc docker:alpine can0 
-moveif docker:alpine vcanbr0
-attachif docker:alpine can2 vcanbr0
-connect docker:alpine vxcan5 docker:ubuntu2 vxcan0
+Usage: canctl [commands]
+commands:
+    addbus <busname> 
+    addif <busname> <device>
+    addifc docker:alpine can0 
+    moveif docker:alpine slcan0
+    attachif docker:alpine can2 vcanbr0
+    connect docker:alpine vxcan5 docker:ubuntu2 vxcan0
+
+container:
+    docker:SHA256
+    docker:alpine_container2
+    pid:12345
 EOF
 exit 1
 }
@@ -202,8 +259,14 @@ if [[ $1 == "addbus" ]] ; then
 	parameter_check "aaa" $2
 	create_bus $2
 
+elif [[ $1 == "delbus" ]] ; then
+	delete_bus $2
+
 elif [[ $1 == "addif" ]] ; then
 	addif_bus $2 $3
+
+elif [[ $1 == "delif" ]] ; then
+	delif_container $2 $3
 
 elif [[ $1 == "addifc" ]] ; then
 	addif_container $2 $3
