@@ -124,6 +124,14 @@ delif_container()
     nsenter -n -t $containerpid ip link del $interface_name type vcan
 }
 
+add_vif()
+{
+    local interface_name=$1 # can0
+
+    ip link add name $interface_name type vcan || perror "error creating device $interface_name"
+    ip link set up dev $interface_name
+}
+
 # to attach host interfaces to a bus
 addif_bus()
 {
@@ -239,6 +247,7 @@ usage()
 Usage: canctl [commands]
 commands:
     addbus <busname> 
+    addvif <device>
     addif <busname> <device>
     addifc docker:alpine can0 
     moveif docker:alpine slcan0
@@ -255,6 +264,9 @@ exit 1
 
 [ $# -lt 1 ] && usage
 
+cmd=$1
+dev=$2
+
 if [[ $1 == "addbus" ]] ; then
 	parameter_check "aaa" $2
 	create_bus $2
@@ -262,7 +274,10 @@ if [[ $1 == "addbus" ]] ; then
 elif [[ $1 == "delbus" ]] ; then
 	delete_bus $2
 
-elif [[ $1 == "addif" ]] ; then
+elif [[ $1 == "addvif" ]] ; then
+	add_vif $dev
+
+elif [[ $cmd == "addif" ]] ; then
 	addif_bus $2 $3
 
 elif [[ $1 == "delif" ]] ; then
